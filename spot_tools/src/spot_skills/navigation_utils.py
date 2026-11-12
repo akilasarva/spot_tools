@@ -5,6 +5,7 @@ from typing import Tuple
 
 import numpy as np
 import shapely
+import shapely.ops
 from bosdyn.api import geometry_pb2
 from bosdyn.api.spot import robot_command_pb2
 from bosdyn.client import math_helpers
@@ -118,6 +119,14 @@ def navigate_to_absolute_pose(
     return cmd_id
 
 
+def track_progress(line, s, point, ahead, back=1.0):
+    lo, hi = max(0.0, s - back), min(line.length, s + ahead)
+    window = shapely.ops.substring(line, lo, hi)
+    if window.length == 0:
+        return s, line
+    return lo + window.project(shapely.Point(point)), window
+
+
 def follow_trajectory_continuous(
     spot,
     waypoints_list: ArrayLike,
@@ -130,6 +139,7 @@ def follow_trajectory_continuous(
     feedback=None,
     cancel_cb=None,
     pause_cb=None,
+    start_progress=None,
 ) -> bool:
     """
     Follows a trajectory by commanding the robot to move to each waypoint in the specified frame.
@@ -147,6 +157,12 @@ def follow_trajectory_continuous(
     spot.robot.ensure_client(RobotCommandClient.default_service_name)
 
     end_pt = waypoints_list[-1, :2]
+    progress = start_progress
+    if progress is not None:
+        full_path = shapely.LineString(waypoints_list[:, :2])
+        ahead = (
+            lookahead_distance + 2 * goal_tolerance + mid_level_planner.lookahead_m()
+        )
     t0 = time.time()
     rate = 10
     # TODO: reactive loop, yeild out the loop to get info
@@ -183,8 +199,13 @@ def follow_trajectory_continuous(
 
         # if mid_level_planner is not None:
         # update path every (couple?) loop
+        path_xy, robot_xy = waypoints_list[:, :2], None
+        if progress is not None:
+            robot_xy = spot.get_pose()[:2]
+            progress, window = track_progress(full_path, progress, robot_xy, ahead)
+            path_xy = np.array(window.coords)
         mlp_success, planning_output = mid_level_planner.plan_path(
-            waypoints_list[:, :2]
+            path_xy, robot_xy=robot_xy
         )
         path = planning_output.path_shapely
         path_wp = planning_output.path_waypoints_metric
@@ -206,7 +227,7 @@ def follow_trajectory_continuous(
             feedback.print(
                 "INFO", "Mid-level planner failed, following high-level path directly"
             )
-            path = shapely.LineString(waypoints_list[:, :2])
+            path = shapely.LineString(path_xy)
 
         tform_body_in_vision = spot.get_pose()
         distance_from_end = np.linalg.norm(

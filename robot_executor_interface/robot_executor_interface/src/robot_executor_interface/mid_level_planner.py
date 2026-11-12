@@ -238,7 +238,12 @@ class MidLevelPlanner:
         )  # (x,y) = (col, row)
         return shapely.line_locate_point(path_shapely, current_point_shapely)
 
-    def plan_path(self, high_level_path_metric):
+    def lookahead_m(self):
+        return self.lookahead_distance_grid * (
+            self.occupancy_map_obj.map_resolution or 0
+        )
+
+    def plan_path(self, high_level_path_metric, robot_xy=None):
         """
         Input: high level path in <robot>/odom frame, Nx2 numpy array
         Output: (bool, path) -> (success, path in odom frame)
@@ -263,9 +268,10 @@ class MidLevelPlanner:
             self.feedback.print(
                 "DEBUG", f"High level path (grid cells): {high_level_path_grid}"
             )
-            current_point_grid = self.global_position_to_grid_cell(
-                self.robot_pose[:, 3].reshape(4, 1)
-            )
+            robot_position = self.robot_pose[:, 3].reshape(4, 1)
+            if robot_xy is not None:
+                robot_position = np.array([*robot_xy, 0, 1]).reshape(4, 1)
+            current_point_grid = self.global_position_to_grid_cell(robot_position)
             current_point_grid = self.project_goal_to_grid_naive(current_point_grid)
             self.feedback.print(
                 "DEBUG", f"Current point (grid cell): {current_point_grid}"
@@ -548,7 +554,10 @@ class IdentityPlanner:
         self.feedback = feedback
         self.feedback.print("INFO", "IdentityPlanner initialized")
 
-    def plan_path(self, high_level_path_metric):
+    def lookahead_m(self):
+        return 0.0
+
+    def plan_path(self, high_level_path_metric, robot_xy=None):
         """
         Input: high level path in <robot>/odom frame, Nx2 numpy array
         Output: (bool, path) -> (success, path in odom frame)

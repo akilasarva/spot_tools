@@ -3,6 +3,7 @@ import time
 from copy import deepcopy
 
 import numpy as np
+import shapely
 import skimage as ski
 from bosdyn.api.robot_state_pb2 import BehaviorFault
 from bosdyn.client.exceptions import LeaseUseError
@@ -19,6 +20,7 @@ from spot_skills.arm_utils import gaze_at_vision_pose
 from spot_skills.grasp_utils import object_grasp, object_place, stow_arm
 from spot_skills.navigation_utils import (
     follow_trajectory_continuous,
+    track_progress,
     turn_to_point,
 )
 
@@ -42,6 +44,11 @@ def _report_action_result(feedback, command, action_index, status, detail=""):
             feedback.print("WARNING", f"action_result feedback failed: {e}")
         except Exception:
             pass  # feedback is unavailable; preserve the execution outcome
+
+
+def _distance_to_path(path, point):
+    geom = shapely.LineString(path) if len(path) > 1 else shapely.Point(path[0])
+    return geom.distance(shapely.Point(point))
 
 
 def transform_command_frame(tf_trans, tf_q, command, feedback=None):
@@ -226,6 +233,8 @@ class SpotExecutor:
             raise ValueError("follow_timeout_per_meter must be positive")
 
         self.lease_manager = None
+        self._takeover_poses = None
+        self._resume_progress = None
 
     def initialize_lease_manager(self, feedback):
         self.lease_manager = LeaseManager(self.spot_interface, feedback)
@@ -296,6 +305,8 @@ class SpotExecutor:
     def process_action_sequence(self, sequence, feedback):
         self.processing_action_sequence = True
         self.keep_going = True
+        self._takeover_poses = None
+        self._resume_progress = None
         with self._pause_lock:
             self.paused = False
 
@@ -339,8 +350,14 @@ class SpotExecutor:
                     self.lease_manager is not None
                     and not self.lease_manager.owner_name.startswith("understanding")
                 ):
-                    time.sleep(0.5)
+                    self._wait_recording_takeover(0.5)
                     continue
+
+                if self._takeover_poses is not None:
+                    next_ix = self._skip_passed_follows(sequence, ix, feedback)
+                    if next_ix != ix:
+                        inner_loop_attempts = 0
+                    ix = next_ix
 
                 command = sequence.actions[ix]
 
@@ -473,13 +490,15 @@ class SpotExecutor:
                         inner_loop_attempts = 0
                     else:
                         inner_loop_attempts += 1
-                        time.sleep(1)
+                        self._wait_recording_takeover(
+                            1.0, takeover=not feedback.plan_valid
+                        )
 
                 except LeaseUseError:
                     feedback.print("INFO", "Lost lease, stopping action sequence.")
                     feedback.log_lease_takeover("manual_intervention")
                     # Wait until the lease manager has taken the lease back
-                    time.sleep(2)
+                    self._wait_recording_takeover(2.0, takeover=True)
                 except Exception:
                     # The sequence is aborted: report the action as failed, so
                     # whatever planned it hears now rather than never.
@@ -501,6 +520,88 @@ class SpotExecutor:
             raise
 
         self.processing_action_sequence = False
+
+    def _wait_recording_takeover(self, duration, takeover=False):
+        t_end = time.time() + duration
+        while True:
+            lm = self.lease_manager
+            if self._takeover_poses is None and (
+                takeover
+                or (lm is not None and not lm.owner_name.startswith("understanding"))
+            ):
+                self._takeover_poses = []
+            if self._takeover_poses is not None:
+                try:
+                    self._takeover_poses.append(
+                        tuple(self.spot_interface.get_pose()[:2])
+                    )
+                except Exception:
+                    pass
+            remaining = t_end - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.1, remaining))
+
+    def _path_xy(self, command):
+        t, r = self.transform_lookup("<spot_vision_frame>", command.frame)
+        return transform_command_frame(t, r, command.path2d)[:, :2]
+
+    def _skip_passed_follows(self, sequence, ix, feedback):
+        self._wait_recording_takeover(0)
+        poses, self._takeover_poses = self._takeover_poses, None
+        if not poses:
+            return ix
+        traj = np.asarray(poses, dtype=float)
+        start = 0
+        ix0 = ix
+        try:
+            while (
+                ix + 1 < len(sequence.actions)
+                and type(sequence.actions[ix]) is Follow
+                and type(sequence.actions[ix + 1]) is Follow
+            ):
+                path = self._path_xy(sequence.actions[ix])
+                near = np.linalg.norm(traj[start:] - path[-1], axis=1)
+                near = np.nonzero(near < self.goal_tolerance)[0]
+                if near.size:
+                    start += int(near[0])
+                elif not self._on_next_follow(
+                    path, self._path_xy(sequence.actions[ix + 1]), traj[-1]
+                ):
+                    break
+                feedback.print("INFO", f"Skipping Follow {ix}, passed during takeover")
+                _report_action_result(
+                    feedback,
+                    sequence.actions[ix],
+                    ix,
+                    "SUCCESS",
+                    "passed during lease takeover",
+                )
+                report = getattr(feedback, "report_action_done", None)
+                if report is not None:
+                    report(sequence, sequence.actions[ix], True)
+                ix += 1
+            if type(sequence.actions[ix]) is Follow:
+                line = shapely.LineString(self._path_xy(sequence.actions[ix]))
+                if ix == ix0:
+                    s = line.project(shapely.Point(traj[0]))
+                    for p in traj[1:]:
+                        s, _ = track_progress(line, s, p, ahead=3.0)
+                else:
+                    s = line.project(shapely.Point(traj[-1]))
+                self._resume_progress = s
+        except Exception as ex:
+            feedback.print("WARNING", f"Passed-waypoint check failed, resuming: {ex}")
+        return ix
+
+    @staticmethod
+    def _on_next_follow(path, nxt, here, margin=0.5):
+        seg = nxt[min(1, len(nxt) - 1)] - nxt[0]
+        if np.linalg.norm(seg) < 1e-6 or np.dot(here - nxt[0], seg) <= 0:
+            return False
+        if len(path) > 1 and np.dot(here - path[-1], path[-1] - path[-2]) > 0:
+            return True
+        return _distance_to_path(nxt, here) + margin < _distance_to_path(path, here)
 
     def execute_gaze(self, command, feedback, pick_next=False):
         # TODO: need to transform command to robot odom frame
@@ -695,5 +796,7 @@ class SpotExecutor:
                 feedback=feedback,
                 cancel_cb=lambda: self.keep_going,
                 pause_cb=lambda: self.paused,
+                start_progress=self._resume_progress,
             )
+        self._resume_progress = None
         return ret
